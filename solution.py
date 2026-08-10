@@ -9,9 +9,11 @@ Approach: document order is a pre-order traversal of the statute tree, so the
 tree is fully determined by the per-provision depth sequence (verified lossless
 on train: nearest-earlier-at-depth-1 attachment reconstructs 100% of parents).
 We train two depth-emission models from scratch in-script —
-(A) a fixed 5-seed ensemble of neural act-level BiLSTM taggers over learned
-provision encoders and (B) a LightGBM multiclass model on hand + TF-IDF/SVD
-features — blend their log-probabilities, apply a rare-depth prior adjustment
+(A) a fixed 8-seed ensemble of neural act-level BiLSTM taggers over learned
+provision encoders (trained word embeddings + a hashed char-ngram EmbeddingBag
+channel + hand features; NO fitted text statistics such as TF-IDF anywhere)
+and (B) a LightGBM multiclass model on hand/neighbor features only — blend
+their log-probabilities, apply a rare-depth prior adjustment
 (log p - tau * log prior, counteracting argmax shrinkage of deep classes),
 decode each act with a constrained Viterbi (d0=0, d[i] <= d[i-1]+1, optional
 smoothed transition prior), and attach parent[i] = nearest earlier provision
@@ -32,6 +34,7 @@ import re
 import shutil
 import sys
 import time
+import zlib
 from collections import Counter
 from pathlib import Path
 
@@ -351,6 +354,23 @@ import torch.nn as nn
 _TOK = re.compile(r"[a-z]+|\d+|[^\sa-z\d]")
 PAD, UNK = 0, 1
 MAX_TOK = 140
+# Hashed char-ngram EmbeddingBag channel: fully-learned text representation
+# (deterministic crc32 bucketing; embeddings trained in-model — no fitted
+# text statistics). CNG_DIM=0 disables.
+CNG_DIM = 64
+CNG_BUCKETS = 32768
+CNG_HEAD, CNG_TAIL = 512, 64
+
+
+def char_ngram_ids(text):
+    """Deterministic hashed char 3+4-gram bucket ids for one provision."""
+    s = text.lower()
+    if len(s) > CNG_HEAD + CNG_TAIL:
+        s = s[:CNG_HEAD] + s[-CNG_TAIL:]
+    b = ("^" + s + "$").encode("utf-8", "ignore")
+    ids = [zlib.crc32(b[i:i + n]) % CNG_BUCKETS
+           for n in (3, 4) for i in range(max(len(b) - n + 1, 1))]
+    return np.asarray(ids, dtype=np.int64)
 
 
 def tokenize(text):
@@ -378,11 +398,15 @@ def encode_provision(text, vocab):
 
 class DepthTagger(nn.Module):
     def __init__(self, vocab_size, feat_dim, emb_dim=NN_EMB, enc_dim=256,
-                 hid=NN_HID, num_layers=2):
+                 hid=NN_HID, num_layers=2, cng_dim=CNG_DIM):
         super().__init__()
         self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=PAD)
+        self.cng_dim = cng_dim
+        in_dim = emb_dim * 3 + feat_dim + (cng_dim if cng_dim > 0 else 0)
+        if cng_dim > 0:
+            self.cng_bag = nn.EmbeddingBag(CNG_BUCKETS, cng_dim, mode="mean")
         self.enc = nn.Sequential(
-            nn.Linear(emb_dim * 3 + feat_dim, enc_dim), nn.ReLU(), nn.Dropout(0.3))
+            nn.Linear(in_dim, enc_dim), nn.ReLU(), nn.Dropout(0.3))
         self.lstm = nn.LSTM(enc_dim, hid, num_layers=num_layers, batch_first=True,
                             bidirectional=True, dropout=0.2)
         self.head = nn.Linear(2 * hid, N_STATES)
@@ -391,8 +415,12 @@ class DepthTagger(nn.Module):
         mask = (ids != PAD).float().unsqueeze(-1)
         return (self.emb(ids) * mask).sum(1) / mask.sum(1).clamp(min=1.0)
 
-    def forward(self, ids, f8, l8, feats, act_lens):
-        v = torch.cat([self._mmean(ids), self._mmean(f8), self._mmean(l8), feats], 1)
+    def forward(self, ids, f8, l8, cng, cng_off, feats, act_lens):
+        parts = [self._mmean(ids), self._mmean(f8), self._mmean(l8)]
+        if self.cng_dim > 0:
+            parts.append(self.cng_bag(cng, cng_off))
+        parts.append(feats)
+        v = torch.cat(parts, 1)
         h = self.enc(v)
         B, L = len(act_lens), max(act_lens)
         padded = torch.zeros(B, L, h.shape[1])
@@ -422,6 +450,13 @@ class ActDataset:
             ([encode_provision(t, vocab) for t in provs],
              ((feats - mu) / sd).astype(np.float32))
             for provs, feats in zip(provs_per_act, feats_per_act)]
+        self.cng = None
+        if CNG_DIM > 0:
+            self.cng = []
+            for provs in provs_per_act:
+                per = [char_ngram_ids(t) for t in provs]
+                lens = np.asarray([len(a) for a in per], dtype=np.int64)
+                self.cng.append((np.concatenate(per), lens))
 
     def batch(self, act_indices):
         ids, f8, l8, feats, act_lens = [], [], [], [], []
@@ -431,7 +466,14 @@ class ActDataset:
             for (a, b, c) in enc:
                 ids.append(a); f8.append(b); l8.append(c)
             feats.append(z)
-        return (pad_batch(ids), pad_batch(f8), pad_batch(l8),
+        cng = cng_off = None
+        if self.cng is not None:
+            flats = [self.cng[ai][0] for ai in act_indices]
+            lens = np.concatenate([self.cng[ai][1] for ai in act_indices])
+            cng = torch.as_tensor(np.concatenate(flats))
+            cng_off = torch.as_tensor(
+                np.concatenate([[0], np.cumsum(lens)[:-1]]))
+        return (pad_batch(ids), pad_batch(f8), pad_batch(l8), cng, cng_off,
                 torch.as_tensor(np.vstack(feats)), act_lens)
 
 
@@ -441,8 +483,9 @@ def nn_proba(model, ds, batch_acts=64):
     out = []
     for s in range(0, len(ds.acts), batch_acts):
         idxs = list(range(s, min(s + batch_acts, len(ds.acts))))
-        ids, f8, l8, feats, act_lens = ds.batch(idxs)
-        out.append(torch.softmax(model(ids, f8, l8, feats, act_lens), 1).numpy())
+        ids, f8, l8, cng, cng_off, feats, act_lens = ds.batch(idxs)
+        out.append(torch.softmax(
+            model(ids, f8, l8, cng, cng_off, feats, act_lens), 1).numpy())
     return np.vstack(out)
 
 
@@ -459,10 +502,10 @@ def train_tagger(model, ds_tr, y_tr_per_act, ds_va, y_va_flat,
         tot = cnt = 0.0
         for s in range(0, len(order), batch_acts):
             idxs = order[s:s + batch_acts]
-            ids, f8, l8, feats, act_lens = ds_tr.batch(idxs)
+            ids, f8, l8, cng, cng_off, feats, act_lens = ds_tr.batch(idxs)
             y = torch.cat([ys[i] for i in idxs])
             opt.zero_grad()
-            loss = lossf(model(ids, f8, l8, feats, act_lens), y)
+            loss = lossf(model(ids, f8, l8, cng, cng_off, feats, act_lens), y)
             loss.backward()
             opt.step()
             tot += float(loss) * len(y); cnt += len(y)
@@ -513,8 +556,6 @@ def write_submission(sub_path, act_ids, preds, test_df):
 # ----------------------------------------------------------------------------
 
 def main():
-    from sklearn.decomposition import TruncatedSVD
-    from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.model_selection import train_test_split
     import lightgbm as lgb
 
@@ -554,28 +595,13 @@ def main():
     te_lens = [len(p) for p in te_provs]
     log(f"hand features {Xh_tr.shape} (+val {Xh_va.shape}, +test {Xh_te.shape})")
 
-    # ---- TF-IDF -> SVD (fit on train-split text only) ----
-    flat_tr = [t for a in tr_provs for t in a]
-    flat_va = [t for a in va_provs for t in a]
-    flat_te = [t for a in te_provs for t in a]
-    tw = TfidfVectorizer(ngram_range=(1, 2), min_df=5, max_features=150_000,
-                         sublinear_tf=True)
-    Tw_tr = tw.fit_transform(flat_tr)
-    svd_w = TruncatedSVD(n_components=60, random_state=SEED)
-    Sw_tr = svd_w.fit_transform(Tw_tr)
-    Sw_va = svd_w.transform(tw.transform(flat_va))
-    Sw_te = svd_w.transform(tw.transform(flat_te))
-    tc = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=5,
-                         max_features=200_000, sublinear_tf=True)
-    Tc_tr = tc.fit_transform(flat_tr)
-    svd_c = TruncatedSVD(n_components=40, random_state=SEED)
-    Sc_tr = svd_c.fit_transform(Tc_tr)
-    Sc_va = svd_c.transform(tc.transform(flat_va))
-    Sc_te = svd_c.transform(tc.transform(flat_te))
-    X_tr = np.hstack([Xh_tr, Sw_tr, Sc_tr]).astype(np.float32)
-    X_va = np.hstack([Xh_va, Sw_va, Sc_va]).astype(np.float32)
-    X_te = np.hstack([Xh_te, Sw_te, Sc_te]).astype(np.float32)
-    log(f"full X {X_tr.shape}; tfidf+svd done")
+    # ---- NO fitted text statistics (TF-IDF/SVD removed per challenge
+    # guidance): the LGBM sees hand/neighbor features only, and all text
+    # signal is LEARNED inside the NN (trained word embeddings + hashed
+    # char-ngram EmbeddingBag channel). ----
+    flat_tr = [t for a in tr_provs for t in a]  # NN vocab source only
+    X_tr, X_va, X_te = Xh_tr, Xh_va, Xh_te
+    log(f"LGBM X = hand features only {X_tr.shape} (TF-IDF-free recipe)")
 
     # ---- Model B: LightGBM ----
     params = dict(objective="multiclass", num_class=N_STATES, num_leaves=127,
