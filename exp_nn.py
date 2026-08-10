@@ -30,7 +30,7 @@ def log(msg):
 
 
 np.random.seed(SEED)
-torch.set_num_threads(os.cpu_count() or 8)
+torch.set_num_threads(int(os.environ.get("NN_THREADS", str(os.cpu_count() or 8))))
 device = "cpu"
 
 train = pd.read_csv(os.path.join(DATA, "train.csv"))
