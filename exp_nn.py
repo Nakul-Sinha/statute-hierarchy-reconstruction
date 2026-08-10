@@ -101,7 +101,8 @@ model = DepthTagger(len(vocab), allf.shape[1], emb_dim=EMB,
                     lstm_hidden=HID, num_layers=LAYERS, use_attn=ATTN)
 n_params = sum(p.numel() for p in model.parameters())
 log(f"model params={n_params/1e6:.2f}M (emb={EMB} hid={HID} layers={LAYERS} "
-    f"attn={ATTN} cos={COS} seed={NN_SEED} epochs={EPOCHS})")
+    f"attn={ATTN} cos={COS} cng={os.environ.get('NN_CNG', '0')} "
+    f"svd={os.environ.get('NN_SVD', '0')} seed={NN_SEED} epochs={EPOCHS})")
 
 best_state, best_acc = train_tagger(
     model, ds_tr, tr_depths, ds_va, y_va_flat, device,

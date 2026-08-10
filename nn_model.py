@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import zlib
 from collections import Counter
 
 import numpy as np
@@ -13,6 +14,24 @@ _TOK = re.compile(r"[a-z]+|\d+|[^\sa-z\d]")
 PAD, UNK = 0, 1
 MAX_TOK = int(os.environ.get("NN_MAXTOK", "140"))  # first MAX-20 + last 20
 FL = int(os.environ.get("NN_FL", "8"))             # first/last token span
+
+# Hashed char-ngram EmbeddingBag channel (fully learned; deterministic crc32
+# bucketing, no fitted text statistics). NN_CNG = embedding dim, 0 = off.
+CNG_DIM = int(os.environ.get("NN_CNG", "0"))
+CNG_BUCKETS = int(os.environ.get("NN_CNG_BUCKETS", "32768"))
+CNG_HEAD = int(os.environ.get("NN_CNG_HEAD", "512"))  # leading chars used
+CNG_TAIL = int(os.environ.get("NN_CNG_TAIL", "64"))   # trailing chars used
+
+
+def char_ngram_ids(text: str) -> np.ndarray:
+    """Deterministic hashed char 3+4-gram bucket ids for one provision."""
+    s = text.lower()
+    if len(s) > CNG_HEAD + CNG_TAIL:
+        s = s[:CNG_HEAD] + s[-CNG_TAIL:]
+    b = ("^" + s + "$").encode("utf-8", "ignore")
+    ids = [zlib.crc32(b[i:i + n]) % CNG_BUCKETS
+           for n in (3, 4) for i in range(max(len(b) - n + 1, 1))]
+    return np.asarray(ids, dtype=np.int64)
 
 
 def tokenize(text: str) -> list:
@@ -47,10 +66,14 @@ def encode_provision(text: str, vocab: dict):
 
 class DepthTagger(nn.Module):
     def __init__(self, vocab_size, feat_dim, emb_dim=100, enc_dim=256,
-                 lstm_hidden=128, num_layers=1, use_attn=False):
+                 lstm_hidden=128, num_layers=1, use_attn=False, cng_dim=CNG_DIM):
         super().__init__()
         self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=PAD)
         in_dim = emb_dim * 3 + feat_dim
+        self.cng_dim = cng_dim
+        if cng_dim > 0:
+            self.cng_bag = nn.EmbeddingBag(CNG_BUCKETS, cng_dim, mode="mean")
+            in_dim += cng_dim
         self.enc = nn.Sequential(nn.Linear(in_dim, enc_dim), nn.ReLU(), nn.Dropout(0.3))
         self.lstm = nn.LSTM(enc_dim, lstm_hidden, num_layers=num_layers,
                             batch_first=True, bidirectional=True,
@@ -68,12 +91,16 @@ class DepthTagger(nn.Module):
         emb = self.emb(ids)  # (P, T, E)
         return (emb * mask).sum(1) / mask.sum(1).clamp(min=1.0)
 
-    def forward(self, ids, f8, l8, feats, act_lens):
-        """ids/f8/l8: padded (P, *) token ids; feats: (P, F);
+    def forward(self, ids, f8, l8, cng, cng_off, feats, act_lens):
+        """ids/f8/l8: padded (P, *) token ids; cng/cng_off: flat hashed ngram
+        ids + per-provision offsets (or None); feats: (P, F);
         act_lens: list of provisions per act (sum = P). Returns (P, 7) logits."""
-        v = torch.cat(
-            [self._masked_mean(ids), self._masked_mean(f8), self._masked_mean(l8), feats],
-            dim=1)
+        parts = [self._masked_mean(ids), self._masked_mean(f8),
+                 self._masked_mean(l8)]
+        if self.cng_dim > 0:
+            parts.append(self.cng_bag(cng, cng_off))
+        parts.append(feats)
+        v = torch.cat(parts, dim=1)
         h = self.enc(v)  # (P, enc)
         # scatter into (B, L, enc)
         B = len(act_lens)
@@ -115,10 +142,15 @@ class ActDataset:
 
     def __init__(self, provs_per_act, vocab, feats_per_act, mu, sd):
         self.acts = []
+        self.cng = [] if CNG_DIM > 0 else None
         for provs, feats in zip(provs_per_act, feats_per_act):
             enc = [encode_provision(t, vocab) for t in provs]
             z = ((feats - mu) / sd).astype(np.float32)
             self.acts.append((enc, z))
+            if self.cng is not None:
+                per = [char_ngram_ids(t) for t in provs]
+                lens = np.asarray([len(a) for a in per], dtype=np.int64)
+                self.cng.append((np.concatenate(per), lens))
 
     def batch(self, act_indices, device):
         ids, f8, l8, feats, act_lens = [], [], [], [], []
@@ -128,7 +160,15 @@ class ActDataset:
             for (i_, a_, b_) in enc:
                 ids.append(i_); f8.append(a_); l8.append(b_)
             feats.append(z)
+        cng = cng_off = None
+        if self.cng is not None:
+            flats = [self.cng[ai][0] for ai in act_indices]
+            lens = np.concatenate([self.cng[ai][1] for ai in act_indices])
+            cng = torch.as_tensor(np.concatenate(flats), device=device)
+            cng_off = torch.as_tensor(
+                np.concatenate([[0], np.cumsum(lens)[:-1]]), device=device)
         return (pad_batch(ids, device), pad_batch(f8, device), pad_batch(l8, device),
+                cng, cng_off,
                 torch.as_tensor(np.vstack(feats), device=device), act_lens)
 
 
@@ -151,10 +191,10 @@ def train_tagger(model, ds_tr, y_tr_per_act, ds_va, y_va_flat, device,
         tot_loss = tot_n = 0
         for s in range(0, n_acts, batch_acts):
             idxs = order[s:s + batch_acts]
-            ids, f8, l8, feats, act_lens = ds_tr.batch(idxs, device)
+            ids, f8, l8, cng, cng_off, feats, act_lens = ds_tr.batch(idxs, device)
             y = torch.cat([y_flat_per_act[i] for i in idxs]).to(device)
             opt.zero_grad()
-            logits = model(ids, f8, l8, feats, act_lens)
+            logits = model(ids, f8, l8, cng, cng_off, feats, act_lens)
             loss = lossf(logits, y)
             loss.backward()
             opt.step()
@@ -189,8 +229,8 @@ def predict_proba(model, ds, device, batch_acts=64):
     n = len(ds.acts)
     for s in range(0, n, batch_acts):
         idxs = list(range(s, min(s + batch_acts, n)))
-        ids, f8, l8, feats, act_lens = ds.batch(idxs, device)
-        logits = model(ids, f8, l8, feats, act_lens)
+        ids, f8, l8, cng, cng_off, feats, act_lens = ds.batch(idxs, device)
+        logits = model(ids, f8, l8, cng, cng_off, feats, act_lens)
         out.append(torch.softmax(logits, dim=1).cpu().numpy())
     return np.vstack(out)
 

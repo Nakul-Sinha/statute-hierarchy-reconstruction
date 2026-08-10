@@ -40,30 +40,37 @@ y_tr = np.concatenate([np.asarray(d) for d in tr_depths])
 y_va = np.concatenate([np.asarray(d) for d in va_depths])
 log(f"hand features: {Xh_tr.shape} / {Xh_va.shape}")
 
-# TF-IDF -> SVD (fit on training acts only)
-flat_tr = [t for act in tr_provs for t in act]
-flat_va = [t for act in va_provs for t in act]
+# TF-IDF -> SVD (fit on training acts only). LGBM_TFIDF=0 disables the block
+# entirely (TF-IDF-free mode: hand+neighbor features only).
+USE_TFIDF = int(os.environ.get("LGBM_TFIDF", "1"))
+if USE_TFIDF:
+    flat_tr = [t for act in tr_provs for t in act]
+    flat_va = [t for act in va_provs for t in act]
 
-tw = TfidfVectorizer(ngram_range=(1, 2), min_df=5, max_features=150_000,
-                     lowercase=True, sublinear_tf=True)
-Tw_tr = tw.fit_transform(flat_tr)
-Tw_va = tw.transform(flat_va)
-svd_w = TruncatedSVD(n_components=60, random_state=SEED)
-Sw_tr = svd_w.fit_transform(Tw_tr)
-Sw_va = svd_w.transform(Tw_va)
-log(f"word tfidf {Tw_tr.shape} -> svd 60 (evr={svd_w.explained_variance_ratio_.sum():.3f})")
+    tw = TfidfVectorizer(ngram_range=(1, 2), min_df=5, max_features=150_000,
+                         lowercase=True, sublinear_tf=True)
+    Tw_tr = tw.fit_transform(flat_tr)
+    Tw_va = tw.transform(flat_va)
+    svd_w = TruncatedSVD(n_components=60, random_state=SEED)
+    Sw_tr = svd_w.fit_transform(Tw_tr)
+    Sw_va = svd_w.transform(Tw_va)
+    log(f"word tfidf {Tw_tr.shape} -> svd 60 (evr={svd_w.explained_variance_ratio_.sum():.3f})")
 
-tc = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=5,
-                     max_features=200_000, sublinear_tf=True)
-Tc_tr = tc.fit_transform(flat_tr)
-Tc_va = tc.transform(flat_va)
-svd_c = TruncatedSVD(n_components=40, random_state=SEED)
-Sc_tr = svd_c.fit_transform(Tc_tr)
-Sc_va = svd_c.transform(Tc_va)
-log(f"char tfidf {Tc_tr.shape} -> svd 40 (evr={svd_c.explained_variance_ratio_.sum():.3f})")
+    tc = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=5,
+                         max_features=200_000, sublinear_tf=True)
+    Tc_tr = tc.fit_transform(flat_tr)
+    Tc_va = tc.transform(flat_va)
+    svd_c = TruncatedSVD(n_components=40, random_state=SEED)
+    Sc_tr = svd_c.fit_transform(Tc_tr)
+    Sc_va = svd_c.transform(Tc_va)
+    log(f"char tfidf {Tc_tr.shape} -> svd 40 (evr={svd_c.explained_variance_ratio_.sum():.3f})")
 
-X_tr = np.hstack([Xh_tr, Sw_tr, Sc_tr]).astype(np.float32)
-X_va = np.hstack([Xh_va, Sw_va, Sc_va]).astype(np.float32)
+    X_tr = np.hstack([Xh_tr, Sw_tr, Sc_tr]).astype(np.float32)
+    X_va = np.hstack([Xh_va, Sw_va, Sc_va]).astype(np.float32)
+else:
+    X_tr = Xh_tr.astype(np.float32)
+    X_va = Xh_va.astype(np.float32)
+    log("TF-IDF disabled (LGBM_TFIDF=0): hand features only")
 log(f"full X: {X_tr.shape}")
 
 params = dict(
@@ -83,7 +90,8 @@ import os
 SCRATCH = os.environ.get(
     "CH3_SCRATCH",
     r"C:\Users\nakul\AppData\Local\Temp\claude\G--Datacurve-Latest-Chals\c252d314-4a06-4b8d-a7b1-0935a59ec986\scratchpad")
-np.save(os.path.join(SCRATCH, "va_emis_lgbm.npy"), proba_va)
+np.save(os.path.join(SCRATCH, os.environ.get("CH3_LGB_OUT", "va_emis_lgbm.npy")),
+        proba_va)
 
 logT = transition_matrix(tr_depths)
 log_emis_all = np.log(np.clip(proba_va, 1e-12, None))
