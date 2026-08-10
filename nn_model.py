@@ -44,13 +44,15 @@ def encode_provision(text: str, vocab: dict):
 
 
 class DepthTagger(nn.Module):
-    def __init__(self, vocab_size, feat_dim, emb_dim=100, enc_dim=256, lstm_hidden=128):
+    def __init__(self, vocab_size, feat_dim, emb_dim=100, enc_dim=256,
+                 lstm_hidden=128, num_layers=1):
         super().__init__()
         self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=PAD)
         in_dim = emb_dim * 3 + feat_dim
         self.enc = nn.Sequential(nn.Linear(in_dim, enc_dim), nn.ReLU(), nn.Dropout(0.3))
-        self.lstm = nn.LSTM(enc_dim, lstm_hidden, num_layers=1,
-                            batch_first=True, bidirectional=True)
+        self.lstm = nn.LSTM(enc_dim, lstm_hidden, num_layers=num_layers,
+                            batch_first=True, bidirectional=True,
+                            dropout=0.2 if num_layers > 1 else 0.0)
         self.head = nn.Linear(2 * lstm_hidden, 7)
 
     def _masked_mean(self, ids):
@@ -148,6 +150,10 @@ def train_tagger(model, ds_tr, y_tr_per_act, ds_va, y_va_flat, device,
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         else:
             bad += 1
+            if bad == 2:  # plateau: halve LR (helps late-stage oscillation)
+                for g in opt.param_groups:
+                    g["lr"] = max(g["lr"] * 0.5, 1e-4)
+                log(f"  lr -> {opt.param_groups[0]['lr']:.2e}")
             if bad >= patience:
                 log(f"early stop at epoch {ep}")
                 break

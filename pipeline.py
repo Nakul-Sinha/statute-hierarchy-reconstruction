@@ -63,6 +63,54 @@ NEXT_IDX = [0, 11, 26, 2, 21, 1]
 PREV2_IDX = [2, 26, 0]
 
 
+def _runlen_feats(core: np.ndarray) -> np.ndarray:
+    """Medium-range context: distances/runs over cue columns. (n, 12)"""
+    n = core.shape[0]
+    colon = core[:, 2] > 0
+    semi = core[:, 26] > 0
+    period = core[:, 6] > 0
+    follow = core[:, 9] > 0
+    anchor = (core[:, 23] > 0) | (core[:, 24] > 0) | (core[:, 8] > 0) | (core[:, 7] > 0)
+    CAP = 15.0
+    out = np.zeros((n, 12), dtype=np.float32)
+    last_colon = last_follow = last_anchor = -1
+    semi_run = 0
+    period_run = 0
+    colon_cum = 0
+    for i in range(n):
+        out[i, 0] = min(i - last_colon, CAP) if last_colon >= 0 else CAP + 1
+        out[i, 1] = 1.0 if last_colon >= 0 else 0.0
+        out[i, 2] = min(i - last_follow, CAP) if last_follow >= 0 else CAP + 1
+        out[i, 3] = min(i - last_anchor, CAP) if last_anchor >= 0 else CAP + 1
+        out[i, 4] = min(semi_run, CAP)      # consecutive semi-enders just before i
+        out[i, 5] = min(period_run, CAP)
+        out[i, 6] = colon_cum / max(i, 1)   # fraction of colon-enders before i
+        if colon[i]:
+            last_colon = i
+            colon_cum += 1
+        if follow[i]:
+            last_follow = i
+        if anchor[i]:
+            last_anchor = i
+        semi_run = semi_run + 1 if semi[i] else 0
+        period_run = period_run + 1 if period[i] else 0
+    # lookahead distances
+    nxt_colon = nxt_period = -1
+    nxt_semi_run = 0
+    for i in range(n - 1, -1, -1):
+        out[i, 7] = min(nxt_colon - i, CAP) if nxt_colon >= 0 else CAP + 1
+        out[i, 8] = min(nxt_period - i, CAP) if nxt_period >= 0 else CAP + 1
+        out[i, 9] = min(nxt_semi_run, CAP)  # consecutive semi-enders just after i
+        if colon[i]:
+            nxt_colon = i
+        if period[i]:
+            nxt_period = i
+        nxt_semi_run = nxt_semi_run + 1 if semi[i] else 0
+    out[:, 10] = np.cumsum(semi).astype(np.float32) / max(n, 1)
+    out[:, 11] = np.cumsum(period).astype(np.float32) / max(n, 1)
+    return out
+
+
 def act_features(provs: list) -> np.ndarray:
     """Feature matrix (n, F) for one act's provisions."""
     n = len(provs)
@@ -83,7 +131,8 @@ def act_features(provs: list) -> np.ndarray:
         axis=1,
     )
     return np.hstack(
-        [core, prev1[:, PREV_IDX], next1[:, NEXT_IDX], prev2[:, PREV2_IDX], pos]
+        [core, prev1[:, PREV_IDX], next1[:, NEXT_IDX], prev2[:, PREV2_IDX], pos,
+         _runlen_feats(core)]
     ).astype(np.float32)
 
 

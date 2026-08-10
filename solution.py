@@ -139,6 +139,51 @@ def core_feats(t):
     ]
 
 
+def _runlen_feats(core):
+    """Medium-range context: distances/runs over cue columns. (n, 12)"""
+    n = core.shape[0]
+    colon = core[:, 2] > 0
+    semi = core[:, 26] > 0
+    period = core[:, 6] > 0
+    follow = core[:, 9] > 0
+    anchor = (core[:, 23] > 0) | (core[:, 24] > 0) | (core[:, 8] > 0) | (core[:, 7] > 0)
+    CAP = 15.0
+    out = np.zeros((n, 12), dtype=np.float32)
+    last_colon = last_follow = last_anchor = -1
+    semi_run = period_run = colon_cum = 0
+    for i in range(n):
+        out[i, 0] = min(i - last_colon, CAP) if last_colon >= 0 else CAP + 1
+        out[i, 1] = 1.0 if last_colon >= 0 else 0.0
+        out[i, 2] = min(i - last_follow, CAP) if last_follow >= 0 else CAP + 1
+        out[i, 3] = min(i - last_anchor, CAP) if last_anchor >= 0 else CAP + 1
+        out[i, 4] = min(semi_run, CAP)
+        out[i, 5] = min(period_run, CAP)
+        out[i, 6] = colon_cum / max(i, 1)
+        if colon[i]:
+            last_colon = i
+            colon_cum += 1
+        if follow[i]:
+            last_follow = i
+        if anchor[i]:
+            last_anchor = i
+        semi_run = semi_run + 1 if semi[i] else 0
+        period_run = period_run + 1 if period[i] else 0
+    nxt_colon = nxt_period = -1
+    nxt_semi_run = 0
+    for i in range(n - 1, -1, -1):
+        out[i, 7] = min(nxt_colon - i, CAP) if nxt_colon >= 0 else CAP + 1
+        out[i, 8] = min(nxt_period - i, CAP) if nxt_period >= 0 else CAP + 1
+        out[i, 9] = min(nxt_semi_run, CAP)
+        if colon[i]:
+            nxt_colon = i
+        if period[i]:
+            nxt_period = i
+        nxt_semi_run = nxt_semi_run + 1 if semi[i] else 0
+    out[:, 10] = np.cumsum(semi).astype(np.float32) / max(n, 1)
+    out[:, 11] = np.cumsum(period).astype(np.float32) / max(n, 1)
+    return out
+
+
 def act_features(provs):
     n = len(provs)
     core = np.asarray([core_feats(t) for t in provs], dtype=np.float32)
@@ -152,7 +197,7 @@ def act_features(provs):
                     (idx == 0).astype(np.float32),
                     (idx == n - 1).astype(np.float32)], axis=1)
     return np.hstack([core, prev1[:, PREV_IDX], next1[:, NEXT_IDX],
-                      prev2[:, PREV2_IDX], pos]).astype(np.float32)
+                      prev2[:, PREV2_IDX], pos, _runlen_feats(core)]).astype(np.float32)
 
 
 # ----------------------------------------------------------------------------
@@ -319,7 +364,7 @@ def nn_proba(model, ds, batch_acts=64):
 
 
 def train_tagger(model, ds_tr, y_tr_per_act, ds_va, y_va_flat,
-                 max_epochs=30, patience=5, batch_acts=32, lr=1e-3):
+                 max_epochs=40, patience=6, batch_acts=32, lr=1e-3):
     rng = np.random.RandomState(SEED)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     lossf = nn.CrossEntropyLoss(label_smoothing=0.05)
@@ -345,6 +390,9 @@ def train_tagger(model, ds_tr, y_tr_per_act, ds_va, y_va_flat,
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         else:
             bad += 1
+            if bad == 2:  # plateau: halve LR
+                for g in opt.param_groups:
+                    g["lr"] = max(g["lr"] * 0.5, 1e-4)
             if bad >= patience:
                 log("  nn early stop")
                 break
@@ -490,7 +538,7 @@ def main():
     best_cfg, best_sc = (0.0, 0.6), -1.0
     for alpha in alphas:
         le = lp_lgb if lp_nn is None else alpha * lp_nn + (1 - alpha) * lp_lgb
-        for lam in [0.2, 0.4, 0.6, 0.8, 1.0, 1.2]:
+        for lam in [0.0, 0.1, 0.2, 0.4]:
             preds = decode_acts(le, va_lens, logT, lam)
             sc = score_sets(preds, va_pars)
             if sc > best_sc:

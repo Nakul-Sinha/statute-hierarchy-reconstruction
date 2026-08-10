@@ -41,7 +41,7 @@ lp_nn = np.log(np.clip(p_nn, 1e-12, None))
 rows = []
 for alpha in np.arange(0.0, 1.01, 0.1):
     le = alpha * lp_nn + (1 - alpha) * lp_lgb
-    for lam in [0.2, 0.4, 0.6, 0.8, 1.0, 1.2]:
+    for lam in [0.0, 0.1, 0.2, 0.4, 0.6]:
         preds = []
         for k in range(len(va_provs)):
             seq = viterbi(le[offsets[k]:offsets[k + 1]], logT, lam)

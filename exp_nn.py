@@ -53,18 +53,26 @@ ds_va = ActDataset(va_provs, vocab, feats_va, mu, sd)
 y_va_flat = np.concatenate([np.asarray(d) for d in va_depths])
 log("datasets encoded")
 
-model = DepthTagger(len(vocab), allf.shape[1]).to(device)
+EMB = int(os.environ.get("NN_EMB", "100"))
+HID = int(os.environ.get("NN_HID", "128"))
+LAYERS = int(os.environ.get("NN_LAYERS", "1"))
+NN_SEED = int(os.environ.get("NN_SEED", str(SEED)))
+SUFFIX = os.environ.get("CH3_EMIS_SUFFIX", "")
+torch.manual_seed(NN_SEED)
+
+model = DepthTagger(len(vocab), allf.shape[1], emb_dim=EMB,
+                    lstm_hidden=HID, num_layers=LAYERS).to(device)
 n_params = sum(p.numel() for p in model.parameters())
-log(f"model params={n_params/1e6:.2f}M")
+log(f"model params={n_params/1e6:.2f}M (emb={EMB} hid={HID} layers={LAYERS} seed={NN_SEED})")
 
 best_state, best_acc = train_tagger(
     model, ds_tr, tr_depths, ds_va, y_va_flat, device,
-    max_epochs=30, patience=5, batch_acts=32, lr=1e-3, seed=SEED, log=log)
+    max_epochs=40, patience=6, batch_acts=32, lr=1e-3, seed=NN_SEED, log=log)
 model.load_state_dict(best_state)
 log(f"best val depth acc={best_acc:.4f}")
 
 proba_va = predict_proba(model, ds_va, device)
-np.save(os.path.join(SCRATCH, "va_emis_nn.npy"), proba_va)
+np.save(os.path.join(SCRATCH, f"va_emis_nn{SUFFIX}.npy"), proba_va)
 log("val emissions saved")
 
 logT = transition_matrix(tr_depths)
