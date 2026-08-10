@@ -12,7 +12,8 @@ from sklearn.model_selection import train_test_split
 from metric import components, depths_from_parents
 from pipeline import attach_from_depths, build_features, transition_matrix, viterbi
 
-DATA = r"G:\Datacurve\Latest_Chals\Challenge 3\dataset"
+import os
+DATA = os.environ.get("CH3_DATA", r"G:\Datacurve\Latest_Chals\Challenge 3\dataset")
 SEED = 42
 t0 = time.time()
 
@@ -21,7 +22,7 @@ def log(msg):
     print(f"[{time.time()-t0:6.1f}s] {msg}", flush=True)
 
 
-train = pd.read_csv(rf"{DATA}\train.csv")
+train = pd.read_csv(os.path.join(DATA, "train.csv"))
 tr_rows, va_rows = train_test_split(train, test_size=0.15, random_state=SEED)
 log(f"acts: train={len(tr_rows)} val={len(va_rows)}")
 

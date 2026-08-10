@@ -1,4 +1,9 @@
-"""Milestone 4: neural depth tagger (BiLSTM over provision encoders)."""
+"""NN tagger experiment driver (portable; knobs via env vars).
+
+Env knobs: CH3_DATA, CH3_SCRATCH, CH3_EMIS_SUFFIX, NN_SEED, NN_EMB, NN_HID,
+NN_LAYERS, NN_ATTN, NN_COS, NN_EPOCHS, NN_PATIENCE, NN_SVD (append TF-IDF/SVD
+features to the NN input), NN_MAXTOK, NN_FL (read inside nn_model).
+"""
 import json
 import os
 import time
@@ -12,7 +17,7 @@ from metric import components, depths_from_parents
 from nn_model import ActDataset, DepthTagger, build_vocab, predict_proba, train_tagger
 from pipeline import act_features, attach_from_depths, transition_matrix, viterbi
 
-DATA = r"G:\Datacurve\Latest_Chals\Challenge 3\dataset"
+DATA = os.environ.get("CH3_DATA", r"G:\Datacurve\Latest_Chals\Challenge 3\dataset")
 SCRATCH = os.environ.get(
     "CH3_SCRATCH",
     r"C:\Users\nakul\AppData\Local\Temp\claude\G--Datacurve-Latest-Chals\c252d314-4a06-4b8d-a7b1-0935a59ec986\scratchpad")
@@ -24,12 +29,11 @@ def log(msg):
     print(f"[{time.time()-t0:6.1f}s] {msg}", flush=True)
 
 
-torch.manual_seed(SEED)
 np.random.seed(SEED)
 torch.set_num_threads(os.cpu_count() or 8)
 device = "cpu"
 
-train = pd.read_csv(rf"{DATA}\train.csv")
+train = pd.read_csv(os.path.join(DATA, "train.csv"))
 tr_rows, va_rows = train_test_split(train, test_size=0.15, random_state=SEED)
 tr_provs = [json.loads(s) for s in tr_rows["provisions_json"]]
 tr_pars = [json.loads(s) for s in tr_rows["parents_json"]]
@@ -41,6 +45,35 @@ log(f"acts: train={len(tr_provs)} val={len(va_provs)}")
 
 feats_tr = [act_features(p) for p in tr_provs]
 feats_va = [act_features(p) for p in va_provs]
+
+if int(os.environ.get("NN_SVD", "0")):
+    from sklearn.decomposition import TruncatedSVD
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    flat_tr = [t for a in tr_provs for t in a]
+    flat_va = [t for a in va_provs for t in a]
+    tw = TfidfVectorizer(ngram_range=(1, 2), min_df=5, max_features=150_000,
+                         sublinear_tf=True)
+    Sw = TruncatedSVD(n_components=60, random_state=SEED)
+    sw_tr = Sw.fit_transform(tw.fit_transform(flat_tr))
+    sw_va = Sw.transform(tw.transform(flat_va))
+    tc = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=5,
+                         max_features=200_000, sublinear_tf=True)
+    Sc = TruncatedSVD(n_components=40, random_state=SEED)
+    sc_tr = Sc.fit_transform(tc.fit_transform(flat_tr))
+    sc_va = Sc.transform(tc.transform(flat_va))
+    log("tfidf/svd features for NN input ready")
+
+    def _split(mat, provs):
+        out, pos = [], 0
+        for p in provs:
+            out.append(mat[pos:pos + len(p)].astype(np.float32))
+            pos += len(p)
+        return out
+    sw_tr_a, sc_tr_a = _split(sw_tr, tr_provs), _split(sc_tr, tr_provs)
+    sw_va_a, sc_va_a = _split(sw_va, va_provs), _split(sc_va, va_provs)
+    feats_tr = [np.hstack([f, a, b]) for f, a, b in zip(feats_tr, sw_tr_a, sc_tr_a)]
+    feats_va = [np.hstack([f, a, b]) for f, a, b in zip(feats_va, sw_va_a, sc_va_a)]
+
 allf = np.vstack(feats_tr)
 mu, sd = allf.mean(0), allf.std(0) + 1e-6
 log(f"hand features dim={allf.shape[1]}")
@@ -56,18 +89,24 @@ log("datasets encoded")
 EMB = int(os.environ.get("NN_EMB", "100"))
 HID = int(os.environ.get("NN_HID", "128"))
 LAYERS = int(os.environ.get("NN_LAYERS", "1"))
+ATTN = bool(int(os.environ.get("NN_ATTN", "0")))
+COS = bool(int(os.environ.get("NN_COS", "0")))
+EPOCHS = int(os.environ.get("NN_EPOCHS", "40"))
+PATIENCE = int(os.environ.get("NN_PATIENCE", "6"))
 NN_SEED = int(os.environ.get("NN_SEED", str(SEED)))
 SUFFIX = os.environ.get("CH3_EMIS_SUFFIX", "")
 torch.manual_seed(NN_SEED)
 
 model = DepthTagger(len(vocab), allf.shape[1], emb_dim=EMB,
-                    lstm_hidden=HID, num_layers=LAYERS).to(device)
+                    lstm_hidden=HID, num_layers=LAYERS, use_attn=ATTN)
 n_params = sum(p.numel() for p in model.parameters())
-log(f"model params={n_params/1e6:.2f}M (emb={EMB} hid={HID} layers={LAYERS} seed={NN_SEED})")
+log(f"model params={n_params/1e6:.2f}M (emb={EMB} hid={HID} layers={LAYERS} "
+    f"attn={ATTN} cos={COS} seed={NN_SEED} epochs={EPOCHS})")
 
 best_state, best_acc = train_tagger(
     model, ds_tr, tr_depths, ds_va, y_va_flat, device,
-    max_epochs=40, patience=6, batch_acts=32, lr=1e-3, seed=NN_SEED, log=log)
+    max_epochs=EPOCHS, patience=PATIENCE, batch_acts=32, lr=1e-3,
+    seed=NN_SEED, log=log, cosine=COS)
 model.load_state_dict(best_state)
 log(f"best val depth acc={best_acc:.4f}")
 
@@ -79,7 +118,7 @@ logT = transition_matrix(tr_depths)
 log_emis_all = np.log(np.clip(proba_va, 1e-12, None))
 offsets = np.cumsum([0] + [len(a) for a in va_provs])
 best = None
-for lam in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2]:
+for lam in [0.0, 0.1, 0.2]:
     preds = []
     for k in range(len(va_provs)):
         emis = log_emis_all[offsets[k]:offsets[k + 1]]

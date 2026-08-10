@@ -47,15 +47,19 @@ for a in range(7):
 
 for alpha in [0.7, 0.8]:
     le0 = alpha * lp_nn + (1 - alpha) * lp_lgb
-    for tau in [0.0, 0.1, 0.2, 0.3, 0.5, 0.75]:
+    for tau in [0.0, 0.2, 0.3, 0.4, 0.5, 0.6]:
         le = le0 - tau * np.log(prior)[None, :]
-        preds = []
-        deep = 0
-        for k in range(len(va_provs)):
-            seq = viterbi(le[offsets[k]:offsets[k + 1]], MASK, 1.0)
-            deep += sum(1 for d in seq if d >= 3)
-            preds.append(attach_from_depths(seq))
-        comp = components(preds, va_pars)
-        log(f"alpha={alpha:.1f} tau={tau:.2f} norm={comp['normalized']:.4f} "
-            f"pacc={comp['parent_acc']:.4f} depth={comp['depth']:.4f} "
-            f"sibF1={comp['sib_f1']:.4f} d3plus={deep/offsets[-1]:.4f}")
+        from pipeline import transition_matrix
+        logT = transition_matrix(tr_depths)
+        for lam in [0.0, 0.1, 0.2]:
+            preds = []
+            deep = 0
+            for k in range(len(va_provs)):
+                seq = viterbi(le[offsets[k]:offsets[k + 1]], logT if lam > 0 else MASK,
+                              lam if lam > 0 else 1.0)
+                deep += sum(1 for d in seq if d >= 3)
+                preds.append(attach_from_depths(seq))
+            comp = components(preds, va_pars)
+            log(f"alpha={alpha:.1f} tau={tau:.2f} lam={lam:.1f} "
+                f"norm={comp['normalized']:.4f} pacc={comp['parent_acc']:.4f} "
+                f"sibF1={comp['sib_f1']:.4f} d3plus={deep/offsets[-1]:.4f}")

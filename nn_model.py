@@ -1,6 +1,7 @@
 """Neural depth tagger: provision encoder + act BiLSTM, trained from scratch."""
 from __future__ import annotations
 
+import os
 import re
 from collections import Counter
 
@@ -10,7 +11,8 @@ import torch.nn as nn
 
 _TOK = re.compile(r"[a-z]+|\d+|[^\sa-z\d]")
 PAD, UNK = 0, 1
-MAX_TOK = 140  # first 120 + last 20
+MAX_TOK = int(os.environ.get("NN_MAXTOK", "140"))  # first MAX-20 + last 20
+FL = int(os.environ.get("NN_FL", "8"))             # first/last token span
 
 
 def tokenize(text: str) -> list:
@@ -29,23 +31,23 @@ def build_vocab(texts, min_count=2) -> dict:
 
 
 def encode_provision(text: str, vocab: dict):
-    """Returns (ids_truncated, first8, last8) as int lists."""
+    """Returns (ids_truncated, first_FL, last_FL) as int lists."""
     toks = tokenize(text)
     ids = [vocab.get(w, UNK) for w in toks]
     if len(ids) > MAX_TOK:
-        ids_t = ids[:120] + ids[-20:]
+        ids_t = ids[:MAX_TOK - 20] + ids[-20:]
     else:
         ids_t = ids
     if not ids_t:
         ids_t = [UNK]
-    f8 = ids[:8] if ids else [UNK]
-    l8 = ids[-8:] if ids else [UNK]
+    f8 = ids[:FL] if ids else [UNK]
+    l8 = ids[-FL:] if ids else [UNK]
     return ids_t, f8, l8
 
 
 class DepthTagger(nn.Module):
     def __init__(self, vocab_size, feat_dim, emb_dim=100, enc_dim=256,
-                 lstm_hidden=128, num_layers=1):
+                 lstm_hidden=128, num_layers=1, use_attn=False):
         super().__init__()
         self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=PAD)
         in_dim = emb_dim * 3 + feat_dim
@@ -53,6 +55,11 @@ class DepthTagger(nn.Module):
         self.lstm = nn.LSTM(enc_dim, lstm_hidden, num_layers=num_layers,
                             batch_first=True, bidirectional=True,
                             dropout=0.2 if num_layers > 1 else 0.0)
+        self.use_attn = use_attn
+        if use_attn:
+            self.attn = nn.MultiheadAttention(2 * lstm_hidden, 4, batch_first=True,
+                                              dropout=0.1)
+            self.attn_norm = nn.LayerNorm(2 * lstm_hidden)
         self.head = nn.Linear(2 * lstm_hidden, 7)
 
     def _masked_mean(self, ids):
@@ -81,6 +88,13 @@ class DepthTagger(nn.Module):
             padded, torch.as_tensor(act_lens), batch_first=True, enforce_sorted=False)
         out, _ = self.lstm(packed)
         out, _ = nn.utils.rnn.pad_packed_sequence(out, batch_first=True)
+        if self.use_attn:
+            Lp = out.shape[1]
+            pad_mask = torch.ones(B, Lp, dtype=torch.bool, device=dev)
+            for b, n in enumerate(act_lens):
+                pad_mask[b, :n] = False
+            a, _ = self.attn(out, out, out, key_padding_mask=pad_mask)
+            out = self.attn_norm(out + a)
         logits = self.head(out)  # (B, L, 7)
         flat = []
         for b, n in enumerate(act_lens):
@@ -120,10 +134,13 @@ class ActDataset:
 
 def train_tagger(model, ds_tr, y_tr_per_act, ds_va, y_va_flat, device,
                  max_epochs=30, patience=5, batch_acts=32, lr=1e-3,
-                 seed=42, time_left_fn=None, log=print):
+                 seed=42, time_left_fn=None, log=print, cosine=False):
     """Early stopping on val depth accuracy. Returns best state dict."""
     rng = np.random.RandomState(seed)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
+    sched = (torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_epochs,
+                                                        eta_min=lr * 0.05)
+             if cosine else None)
     lossf = nn.CrossEntropyLoss(label_smoothing=0.05)
     n_acts = len(ds_tr.acts)
     y_flat_per_act = [torch.as_tensor(y, dtype=torch.long) for y in y_tr_per_act]
@@ -143,6 +160,8 @@ def train_tagger(model, ds_tr, y_tr_per_act, ds_va, y_va_flat, device,
             opt.step()
             tot_loss += float(loss) * len(y)
             tot_n += len(y)
+        if sched is not None:
+            sched.step()
         acc = eval_depth_acc(model, ds_va, y_va_flat, device)
         log(f"epoch {ep}: loss={tot_loss/tot_n:.4f} val_depth_acc={acc:.4f}")
         if acc > best_acc:
@@ -150,7 +169,7 @@ def train_tagger(model, ds_tr, y_tr_per_act, ds_va, y_va_flat, device,
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         else:
             bad += 1
-            if bad == 2:  # plateau: halve LR (helps late-stage oscillation)
+            if sched is None and bad == 2:  # plateau: halve LR
                 for g in opt.param_groups:
                     g["lr"] = max(g["lr"] * 0.5, 1e-4)
                 log(f"  lr -> {opt.param_groups[0]['lr']:.2e}")
