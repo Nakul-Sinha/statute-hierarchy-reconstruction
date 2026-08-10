@@ -24,20 +24,30 @@ sequence under `d[0]=0`, `d[i] <= d[i-1]+1`, `d <= 6`.
    (from-scratch embeddings, provision encoder = mean/first8/last8 embedding
    pools + hand features -> MLP; 2-layer BiLSTM hid=160; 7-way head),
    early-stopped on holdout depth acc.
-5. Ensemble log-probs (alpha tuned in-run on the internal holdout with fixed
-   grids), decode each act with constrained Viterbi (hard pre-order mask;
-   transition-prior weight lambda tuned in-run, selects 0), attach parents
-   losslessly, validate, write.
+5. Ensemble log-probs with a rare-depth prior adjustment
+   (log p - tau*log prior, counteracting argmax shrinkage of deep classes),
+   decode each act with constrained Viterbi (hard pre-order mask + optional
+   smoothed transition prior). alpha/lambda/tau tuned in-run on the internal
+   holdout with fixed grids; the SAME split-fit transition matrix and class
+   prior are used for tuning and test decode. Attach parents losslessly,
+   validate, write.
 6. The recipe is hardware-independent: CPU-only, threads capped at
-   min(10, cores), fixed seed count and grids. Elapsed-time triggers exist only
-   as crash protection (65-75 min) and never fire on reference hardware; fatal
-   failure still writes a structurally valid submission.
+   min(10, cores) with BLAS pools pinned before numpy import, fixed seed count
+   and grids, N_STATES derived from train at runtime. Both invocation
+   conventions supported (argv paths, or no-args probing with output mirrored
+   to ./working/submission.csv). Elapsed-time triggers exist only as crash
+   protection (65-75 min) and never fire on reference hardware; fatal failure
+   still writes a structurally valid chain submission and exits 0 with a loud
+   FATAL banner.
 
-Final confirmation run (8-thread Zen5, pandas 3.0.5/torch 2.13-cpu/lgbm 4.7):
-15.1 min wall-clock, holdout (562 unseen acts) normalized 0.5768
-(alpha=0.7, lambda=0; 5-seed NN val depth acc 0.6733). Same-machine reruns are
-bit-identical; cross-machine holdout varies ~+/-0.01-0.02 from CPU float
-nondeterminism in torch training.
+Final confirmation run of the frozen revision (8-thread Zen5, pandas 3.0.5 /
+torch 2.13-cpu / lgbm 4.7): holdout (562 unseen acts) normalized 0.5816
+(tuned alpha=0.8, lambda=0.1, tau=0.3; 5-seed NN val depth acc 0.6733);
+23.3 min wall-clock including heavy external CPU contention during the first
+20 min (~17 min clean). The tau depth-prior adjustment was adopted on evidence
+(+0.008 holdout in the isolated study, 0.5768 -> 0.5816 in the final run);
+same-machine reruns are bit-identical; cross-machine holdout varies
+~+/-0.01-0.02 from CPU float nondeterminism in torch training.
 
 ## Files
 
