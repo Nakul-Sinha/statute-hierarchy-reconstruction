@@ -51,10 +51,12 @@ SEED = 42
 # produces the same result regardless of hardware. The elapsed-time triggers are
 # CRASH PROTECTION ONLY: on reference hardware the full recipe finishes in
 # ~15-40 min, so none of them ever fire there.
-NN_SEEDS = (42, 1, 2, 3, 7)          # fixed; never varied by environment
-CRASH_SEED_SKIP_S = 65 * 60          # pathological-slowness protection only
-CRASH_EPOCH_STOP_S = 70 * 60         # pathological-slowness protection only
-CRASH_REFIT_SKIP_S = 75 * 60         # pathological-slowness protection only
+NN_SEEDS = (42, 1, 2, 3, 7, 11, 13, 17)  # fixed; never varied by environment
+NN_EMB = 160                         # provision-token embedding dim
+NN_HID = 256                         # BiLSTM hidden size (per direction)
+CRASH_SEED_SKIP_S = 70 * 60          # pathological-slowness protection only
+CRASH_EPOCH_STOP_S = 78 * 60         # pathological-slowness protection only
+CRASH_REFIT_SKIP_S = 82 * 60         # pathological-slowness protection only
 MIRROR_OUT = Path("working") / "submission.csv"
 
 
@@ -375,8 +377,8 @@ def encode_provision(text, vocab):
 
 
 class DepthTagger(nn.Module):
-    def __init__(self, vocab_size, feat_dim, emb_dim=128, enc_dim=256, hid=160,
-                 num_layers=2):
+    def __init__(self, vocab_size, feat_dim, emb_dim=NN_EMB, enc_dim=256,
+                 hid=NN_HID, num_layers=2):
         super().__init__()
         self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=PAD)
         self.enc = nn.Sequential(
@@ -575,6 +577,18 @@ def main():
     X_te = np.hstack([Xh_te, Sw_te, Sc_te]).astype(np.float32)
     log(f"full X {X_tr.shape}; tfidf+svd done")
 
+    # NN input features per act: hand + SVD (the SAME hand+word/char-SVD rows
+    # the LGBM sees; adopted lever, single-seed +0.013 NN-only holdout).
+    def _split_acts(flat, provs):
+        out, pos = [], 0
+        for p in provs:
+            out.append(flat[pos:pos + len(p)])
+            pos += len(p)
+        return out
+    nnf_tr = _split_acts(X_tr, tr_provs)
+    nnf_va = _split_acts(X_va, va_provs)
+    nnf_te = _split_acts(X_te, te_provs)
+
     # ---- Model B: LightGBM ----
     params = dict(objective="multiclass", num_class=N_STATES, num_leaves=127,
                   learning_rate=0.06, feature_fraction=0.8, bagging_fraction=0.8,
@@ -596,11 +610,11 @@ def main():
     vocab = mu = sd = None
     if elapsed() < CRASH_SEED_SKIP_S:
         try:
-            allf = np.vstack(feats_tr)
+            allf = X_tr  # hand + SVD features, flat over train provisions
             mu, sd = allf.mean(0), allf.std(0) + 1e-6
             vocab = build_vocab(flat_tr, min_count=2)
-            ds_tr = ActDataset(tr_provs, vocab, feats_tr, mu, sd)
-            ds_va = ActDataset(va_provs, vocab, feats_va, mu, sd)
+            ds_tr = ActDataset(tr_provs, vocab, nnf_tr, mu, sd)
+            ds_va = ActDataset(va_provs, vocab, nnf_va, mu, sd)
             log(f"nn vocab={len(vocab)}")
             nn_probas = []
             for sd_i in NN_SEEDS:
@@ -669,7 +683,7 @@ def main():
     lp_te = np.log(np.clip(p_lgb_te, 1e-12, None))
     if nn_models and alpha > 0:
         try:
-            ds_te = ActDataset(te_provs, vocab, feats_te, mu, sd)
+            ds_te = ActDataset(te_provs, vocab, nnf_te, mu, sd)
             p_nn_te = np.mean([nn_proba(m, ds_te) for m in nn_models], axis=0)
             lp_te = alpha * np.log(np.clip(p_nn_te, 1e-12, None)) + (1 - alpha) * lp_te
         except Exception as e:  # noqa: BLE001
