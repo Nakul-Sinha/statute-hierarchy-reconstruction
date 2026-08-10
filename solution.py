@@ -296,12 +296,14 @@ def encode_provision(text, vocab):
 
 
 class DepthTagger(nn.Module):
-    def __init__(self, vocab_size, feat_dim, emb_dim=100, enc_dim=256, hid=128):
+    def __init__(self, vocab_size, feat_dim, emb_dim=128, enc_dim=256, hid=160,
+                 num_layers=2):
         super().__init__()
         self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=PAD)
         self.enc = nn.Sequential(
             nn.Linear(emb_dim * 3 + feat_dim, enc_dim), nn.ReLU(), nn.Dropout(0.3))
-        self.lstm = nn.LSTM(enc_dim, hid, batch_first=True, bidirectional=True)
+        self.lstm = nn.LSTM(enc_dim, hid, num_layers=num_layers, batch_first=True,
+                            bidirectional=True, dropout=0.2)
         self.head = nn.Linear(2 * hid, N_STATES)
 
     def _mmean(self, ids):
@@ -364,8 +366,8 @@ def nn_proba(model, ds, batch_acts=64):
 
 
 def train_tagger(model, ds_tr, y_tr_per_act, ds_va, y_va_flat,
-                 max_epochs=40, patience=6, batch_acts=32, lr=1e-3):
-    rng = np.random.RandomState(SEED)
+                 max_epochs=40, patience=6, batch_acts=32, lr=1e-3, seed=SEED):
+    rng = np.random.RandomState(seed)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     lossf = nn.CrossEntropyLoss(label_smoothing=0.05)
     ys = [torch.as_tensor(y, dtype=torch.long) for y in y_tr_per_act]
@@ -504,9 +506,10 @@ def main():
     log(f"lgbm trained best_iter={best_iter} "
         f"val_depth_acc={(p_lgb_va.argmax(1) == y_va).mean():.4f}")
 
-    # ---- Model A: neural tagger (guarded) ----
+    # ---- Model A: neural taggers, multi-seed (guarded) ----
     p_nn_va = None
-    nn_pack = None
+    nn_models = []
+    vocab = mu = sd = None
     if elapsed() < NN_START_CUTOFF_S:
         try:
             allf = np.vstack(feats_tr)
@@ -515,18 +518,28 @@ def main():
             ds_tr = ActDataset(tr_provs, vocab, feats_tr, mu, sd)
             ds_va = ActDataset(va_provs, vocab, feats_va, mu, sd)
             log(f"nn vocab={len(vocab)}")
-            model = DepthTagger(len(vocab), allf.shape[1])
-            best_state, best_acc = train_tagger(
-                model, ds_tr, tr_depths, ds_va, y_va)
-            if best_state is not None:
-                model.load_state_dict(best_state)
-                p_nn_va = nn_proba(model, ds_va)
-                nn_pack = (model, vocab, mu, sd)
-                log(f"nn trained val_depth_acc={best_acc:.4f}")
+            nn_probas = []
+            for sd_i in (42, 1, 2):
+                if nn_probas and elapsed() > NN_START_CUTOFF_S:
+                    log(f"skipping remaining NN seeds (time guard, elapsed={elapsed():.0f}s)")
+                    break
+                torch.manual_seed(sd_i)
+                model = DepthTagger(len(vocab), allf.shape[1])
+                best_state, best_acc = train_tagger(
+                    model, ds_tr, tr_depths, ds_va, y_va, seed=sd_i)
+                if best_state is not None:
+                    model.load_state_dict(best_state)
+                    nn_probas.append(nn_proba(model, ds_va))
+                    nn_models.append(model)
+                    log(f"nn seed={sd_i} val_depth_acc={best_acc:.4f}")
+            if nn_probas:
+                p_nn_va = np.mean(nn_probas, axis=0)
+                log(f"nn ensemble of {len(nn_probas)} seeds "
+                    f"val_depth_acc={(p_nn_va.argmax(1) == y_va).mean():.4f}")
         except Exception as e:  # noqa: BLE001
             log(f"NN branch failed ({type(e).__name__}: {e}); LGBM-only fallback")
             p_nn_va = None
-            nn_pack = None
+            nn_models = []
     else:
         log("skipping NN (time guard)")
 
@@ -564,11 +577,10 @@ def main():
     p_lgb_te = final_booster.predict(
         X_te, num_iteration=getattr(final_booster, "best_iteration", None) or best_iter)
     lp_te = np.log(np.clip(p_lgb_te, 1e-12, None))
-    if nn_pack is not None and alpha > 0:
+    if nn_models and alpha > 0:
         try:
-            model, vocab, mu, sd = nn_pack
             ds_te = ActDataset(te_provs, vocab, feats_te, mu, sd)
-            p_nn_te = nn_proba(model, ds_te)
+            p_nn_te = np.mean([nn_proba(m, ds_te) for m in nn_models], axis=0)
             lp_te = alpha * np.log(np.clip(p_nn_te, 1e-12, None)) + (1 - alpha) * lp_te
         except Exception as e:  # noqa: BLE001
             log(f"NN test inference failed ({e}); LGBM-only emissions")
