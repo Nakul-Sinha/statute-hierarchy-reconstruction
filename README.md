@@ -20,18 +20,24 @@ sequence under `d[0]=0`, `d[i] <= d[i-1]+1`, `d <= 6`.
    block position).
 3. Model B: LightGBM 7-class depth on hand features + word/char TF-IDF->SVD
    (fit on train split only), early-stopped, then refit on all train.
-4. Model A: 3-seed ensemble of act-level BiLSTM taggers (from-scratch embeddings,
-   provision encoder = mean/first8/last8 embedding pools + hand features -> MLP;
-   2-layer BiLSTM hid=160; 7-way head), early-stopped on holdout depth acc.
-5. Ensemble log-probs (alpha tuned in-run, typically 0.8 NN-heavy), decode each
-   act with constrained Viterbi (hard pre-order mask; empirical transition prior
-   weight lambda tuned in-run, typically 0), attach parents losslessly, validate,
-   write.
-6. Wall-clock guards: seed loop stops if slow; NN failure falls back to
-   LGBM-only; fatal failure still writes a structurally valid submission.
+4. Model A: FIXED 5-seed ensemble (seeds 42/1/2/3/7) of act-level BiLSTM taggers
+   (from-scratch embeddings, provision encoder = mean/first8/last8 embedding
+   pools + hand features -> MLP; 2-layer BiLSTM hid=160; 7-way head),
+   early-stopped on holdout depth acc.
+5. Ensemble log-probs (alpha tuned in-run on the internal holdout with fixed
+   grids), decode each act with constrained Viterbi (hard pre-order mask;
+   transition-prior weight lambda tuned in-run, selects 0), attach parents
+   losslessly, validate, write.
+6. The recipe is hardware-independent: CPU-only, threads capped at
+   min(10, cores), fixed seed count and grids. Elapsed-time triggers exist only
+   as crash protection (65-75 min) and never fire on reference hardware; fatal
+   failure still writes a structurally valid submission.
 
-Holdout (562 unseen acts): normalized 0.587, parent-acc 0.715, depth 0.856,
-sibling-F1 0.708. Runtime ~35-50 min on 10-12 CPU threads.
+Final confirmation run (8-thread Zen5, pandas 3.0.5/torch 2.13-cpu/lgbm 4.7):
+15.1 min wall-clock, holdout (562 unseen acts) normalized 0.5768
+(alpha=0.7, lambda=0; 5-seed NN val depth acc 0.6733). Same-machine reruns are
+bit-identical; cross-machine holdout varies ~+/-0.01-0.02 from CPU float
+nondeterminism in torch training.
 
 ## Files
 

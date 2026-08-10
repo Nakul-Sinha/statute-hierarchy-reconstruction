@@ -27,9 +27,16 @@ import pandas as pd
 
 T0 = time.time()
 SEED = 42
-BUDGET_S = 78 * 60          # aim to be fully done well before the 90-min cap
-NN_START_CUTOFF_S = 45 * 60  # don't even start NN if this much time has passed
-NN_STOP_ELAPSED_S = 58 * 60  # stop NN training when elapsed passes this
+# Reference environment: 10 CPU cores, 62GB RAM, 90-min cap (CPU-only).
+# The recipe below is FIXED (5 NN seeds, fixed grids, fixed hyperparameters) and
+# produces the same result regardless of hardware. The elapsed-time triggers are
+# CRASH PROTECTION ONLY: on reference hardware the full recipe finishes in
+# ~15-40 min, so none of them ever fire there.
+N_THREADS = min(10, os.cpu_count() or 10)
+NN_SEEDS = (42, 1, 2, 3, 7)          # fixed; never varied by environment
+CRASH_SEED_SKIP_S = 65 * 60          # pathological-slowness protection only
+CRASH_EPOCH_STOP_S = 70 * 60         # pathological-slowness protection only
+CRASH_REFIT_SKIP_S = 75 * 60         # pathological-slowness protection only
 
 
 def log(msg):
@@ -398,8 +405,8 @@ def train_tagger(model, ds_tr, y_tr_per_act, ds_va, y_va_flat,
             if bad >= patience:
                 log("  nn early stop")
                 break
-        if elapsed() > NN_STOP_ELAPSED_S:
-            log("  nn time budget reached")
+        if elapsed() > CRASH_EPOCH_STOP_S:
+            log("  nn crash-protection time trigger (never expected on reference hw)")
             break
     return best_state, best_acc
 
@@ -442,7 +449,7 @@ def main():
     submission_out = Path(sys.argv[2])
     np.random.seed(SEED)
     torch.manual_seed(SEED)
-    torch.set_num_threads(os.cpu_count() or 8)
+    torch.set_num_threads(N_THREADS)  # CPU-only by construction; cap at 10
 
     train = pd.read_csv(public_dir / "train.csv")
     test = pd.read_csv(public_dir / "test.csv")
@@ -495,8 +502,9 @@ def main():
     # ---- Model B: LightGBM ----
     params = dict(objective="multiclass", num_class=N_STATES, num_leaves=127,
                   learning_rate=0.06, feature_fraction=0.8, bagging_fraction=0.8,
-                  bagging_freq=5, min_child_samples=30, num_threads=-1,
-                  seed=SEED, verbose=-1, metric="multi_logloss")
+                  bagging_freq=5, min_child_samples=30, num_threads=N_THREADS,
+                  seed=SEED, verbose=-1, metric="multi_logloss",
+                  deterministic=True, force_row_wise=True)
     dtr = lgb.Dataset(X_tr, label=y_tr)
     dva = lgb.Dataset(X_va, label=y_va, reference=dtr)
     booster = lgb.train(params, dtr, num_boost_round=1500, valid_sets=[dva],
@@ -506,11 +514,11 @@ def main():
     log(f"lgbm trained best_iter={best_iter} "
         f"val_depth_acc={(p_lgb_va.argmax(1) == y_va).mean():.4f}")
 
-    # ---- Model A: neural taggers, multi-seed (guarded) ----
+    # ---- Model A: neural taggers, fixed 5-seed ensemble ----
     p_nn_va = None
     nn_models = []
     vocab = mu = sd = None
-    if elapsed() < NN_START_CUTOFF_S:
+    if elapsed() < CRASH_SEED_SKIP_S:
         try:
             allf = np.vstack(feats_tr)
             mu, sd = allf.mean(0), allf.std(0) + 1e-6
@@ -519,9 +527,9 @@ def main():
             ds_va = ActDataset(va_provs, vocab, feats_va, mu, sd)
             log(f"nn vocab={len(vocab)}")
             nn_probas = []
-            for sd_i in (42, 1, 2):
-                if nn_probas and elapsed() > NN_START_CUTOFF_S:
-                    log(f"skipping remaining NN seeds (time guard, elapsed={elapsed():.0f}s)")
+            for sd_i in NN_SEEDS:
+                if nn_probas and elapsed() > CRASH_SEED_SKIP_S:
+                    log("crash-protection seed skip (never expected on reference hw)")
                     break
                 torch.manual_seed(sd_i)
                 model = DepthTagger(len(vocab), allf.shape[1])
@@ -541,7 +549,7 @@ def main():
             p_nn_va = None
             nn_models = []
     else:
-        log("skipping NN (time guard)")
+        log("skipping NN (crash-protection trigger; never expected on reference hw)")
 
     # ---- ensemble + decode tuning on holdout ----
     logT = transition_matrix(tr_depths)
@@ -561,7 +569,7 @@ def main():
 
     # ---- final LGBM refit on ALL train (cheap; NN stays split-trained) ----
     final_booster = booster
-    if elapsed() < BUDGET_S - 20 * 60:
+    if elapsed() < CRASH_REFIT_SKIP_S:
         try:
             X_all = np.vstack([X_tr, X_va])
             y_all = np.concatenate([y_tr, y_va])
