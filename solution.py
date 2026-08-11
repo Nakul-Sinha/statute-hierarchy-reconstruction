@@ -9,7 +9,7 @@ Approach: document order is a pre-order traversal of the statute tree, so the
 tree is fully determined by the per-provision depth sequence (verified lossless
 on train: nearest-earlier-at-depth-1 attachment reconstructs 100% of parents).
 We train two depth-emission models from scratch in-script —
-(A) a fixed 8-seed ensemble of neural act-level BiLSTM taggers over learned
+(A) a fixed 6-seed ensemble of neural act-level BiLSTM taggers over learned
 provision encoders (trained word embeddings + a hashed char-ngram EmbeddingBag
 channel + hand features; NO fitted text statistics such as TF-IDF anywhere)
 and (B) a LightGBM multiclass model on hand/neighbor features only — blend
@@ -50,11 +50,11 @@ import pandas as pd
 T0 = time.time()
 SEED = 42
 # Reference environment: 10 CPU cores, 62GB RAM, 90-min cap (CPU-only).
-# The recipe below is FIXED (5 NN seeds, fixed grids, fixed hyperparameters) and
+# The recipe below is FIXED (6 NN seeds, fixed grids, fixed hyperparameters) and
 # produces the same result regardless of hardware. The elapsed-time triggers are
 # CRASH PROTECTION ONLY: on reference hardware the full recipe finishes in
 # ~15-40 min, so none of them ever fire there.
-NN_SEEDS = (42, 1, 2, 3, 7, 11, 13, 17)  # fixed; never varied by environment
+NN_SEEDS = (42, 1, 2, 3, 7, 11)      # fixed; never varied by environment
 NN_EMB = 160                         # provision-token embedding dim
 NN_HID = 256                         # BiLSTM hidden size (per direction)
 CRASH_SEED_SKIP_S = 70 * 60          # pathological-slowness protection only
@@ -618,7 +618,7 @@ def main():
     log(f"lgbm trained best_iter={best_iter} "
         f"val_depth_acc={(p_lgb_va.argmax(1) == y_va).mean():.4f}")
 
-    # ---- Model A: neural taggers, fixed 5-seed ensemble ----
+    # ---- Model A: neural taggers, fixed 6-seed ensemble ----
     p_nn_va = None
     nn_models = []
     vocab = mu = sd = None
@@ -668,7 +668,7 @@ def main():
     best_cfg, best_sc = (0.0, 0.0, 0.0), -1.0
     for alpha in alphas:
         le_base = lp_lgb if lp_nn is None else alpha * lp_nn + (1 - alpha) * lp_lgb
-        for tau in [0.0, 0.1, 0.2, 0.3]:  # rare-depth prior adjustment
+        for tau in [0.0, 0.1, 0.2, 0.3, 0.4]:  # rare-depth prior adjustment
             le = le_base - tau * log_prior[None, :]
             for lam in [0.0, 0.1, 0.2, 0.4]:
                 preds = decode_acts(le, va_lens, logT, lam)
