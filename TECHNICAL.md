@@ -1,4 +1,4 @@
-# the platform ch3 — Statutory Outline Reconstruction
+# Statute Hierarchy Reconstruction: technical notes
 
 Rebuild the nesting tree of US public-law provisions (parent index per provision).
 Metric: 0.55 parent-acc + 0.25 depth agreement + 0.20 sibling pair-F1, normalized
@@ -62,7 +62,7 @@ Final confirmation run of the frozen revision (322a626) on the box
 (4-core Zen5, 8 threads): 32.0 min wall-clock, in-run tuning chose the SAME
 operating point as the study (alpha=0.8, lambda=0.1, tau=0.4), 6-seed NN
 ensemble val depth acc 0.6665, holdout normalized 0.5944 (vs 0.5986 at the
-emission level in the blend study — within the documented +/-0.01-0.02
+emission level in the blend study, within the documented +/-0.01-0.02
 same-recipe CPU float nondeterminism across retrains). Submission validated:
 1,588 acts, 33,392 provisions, well-founded. The reference grader box has
 10 cores, so the 90-min cap holds with ample margin.
@@ -75,12 +75,12 @@ is the empirical check that this selection is not overfit.
 
 ## Files
 
-- `solution.py` — the submission script (`python3 solution.py <public_dir> <out_csv>`)
-- `metric.py` / `calibrate.py` — replicated metric, calibrated to the chain=0.019 anchor
-- `pipeline.py`, `nn_model.py` — shared components used by experiments
-- `exp_*.py` — experiment drivers (LGBM, NN, blend/subset studies, K-best/rerank)
-- `run_*.sh` — box drivers for the experiment waves
-- `validate_sub.py` — independent grader-style submission validation
+- `solution.py`: the submission script (`python3 solution.py <public_dir> <out_csv>`)
+- `metric.py` / `calibrate.py`: replicated metric, calibrated to the chain=0.019 anchor
+- `pipeline.py`, `nn_model.py`: shared components used by experiments
+- `exp_*.py`: experiment drivers (LGBM, NN, blend/subset studies, K-best/rerank)
+- `run_*.sh`: box drivers for the experiment waves
+- `validate_sub.py`: independent grader-style submission validation
 
 Negative results kept for the record: transition-prior weighting beyond
 lambda~0.1 hurts, MBR decoding over FFBS samples hurts, per-model temperature
