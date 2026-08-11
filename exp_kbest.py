@@ -86,7 +86,8 @@ va_provs = [json.loads(s) for s in va_rows["provisions_json"]]
 va_pars = [json.loads(s) for s in va_rows["parents_json"]]
 offsets = np.cumsum([0] + [len(a) for a in va_provs])
 
-p_lgb = np.load(os.path.join(SCRATCH, "va_emis_lgbm.npy"))
+p_lgb = np.load(os.path.join(SCRATCH,
+                             os.environ.get("CH3_LGB_FILE", "va_emis_lgbm.npy")))
 names = [n.strip() for n in os.environ.get("CH3_NN_FILES", "").split(",") if n.strip()]
 p_nn = np.mean([np.load(os.path.join(SCRATCH, n)) for n in names], axis=0)
 log(f"NN files: {names}")
