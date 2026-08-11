@@ -8,7 +8,7 @@ import pandas as pd
 
 from metric import act_score, depths_from_parents
 
-DATA = r"G:\Datacurve\Latest_Chals\Challenge 3\dataset"
+DATA = r"G:\ml\Latest_Chals\Challenge 3\dataset"
 
 
 def attach_from_depths(depths):

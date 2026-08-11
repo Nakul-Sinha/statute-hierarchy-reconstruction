@@ -13,7 +13,7 @@ from metric import components, depths_from_parents
 from pipeline import attach_from_depths, build_features, transition_matrix, viterbi
 
 import os
-DATA = os.environ.get("CH3_DATA", r"G:\Datacurve\Latest_Chals\Challenge 3\dataset")
+DATA = os.environ.get("CH3_DATA", r"G:\ml\Latest_Chals\Challenge 3\dataset")
 SEED = 42
 t0 = time.time()
 
@@ -89,7 +89,7 @@ log(f"raw argmax depth acc (val): {(proba_va.argmax(1) == y_va).mean():.4f}")
 import os
 SCRATCH = os.environ.get(
     "CH3_SCRATCH",
-    r"C:\Users\nakul\AppData\Local\Temp\claude\G--Datacurve-Latest-Chals\c252d314-4a06-4b8d-a7b1-0935a59ec986\scratchpad")
+    r"D:\scratch\ch3")
 np.save(os.path.join(SCRATCH, os.environ.get("CH3_LGB_OUT", "va_emis_lgbm.npy")),
         proba_va)
 

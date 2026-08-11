@@ -17,7 +17,7 @@ from sklearn.model_selection import train_test_split
 from metric import act_score, components, depths_from_parents
 from pipeline import attach_from_depths, transition_matrix
 
-DATA = os.environ.get("CH3_DATA", r"G:\Datacurve\Latest_Chals\Challenge 3\dataset")
+DATA = os.environ.get("CH3_DATA", r"G:\ml\Latest_Chals\Challenge 3\dataset")
 SCRATCH = os.environ.get("CH3_SCRATCH", ".")
 SEED = 42
 K = int(os.environ.get("KB_K", "16"))

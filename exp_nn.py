@@ -17,10 +17,10 @@ from metric import components, depths_from_parents
 from nn_model import ActDataset, DepthTagger, build_vocab, predict_proba, train_tagger
 from pipeline import act_features, attach_from_depths, transition_matrix, viterbi
 
-DATA = os.environ.get("CH3_DATA", r"G:\Datacurve\Latest_Chals\Challenge 3\dataset")
+DATA = os.environ.get("CH3_DATA", r"G:\ml\Latest_Chals\Challenge 3\dataset")
 SCRATCH = os.environ.get(
     "CH3_SCRATCH",
-    r"C:\Users\nakul\AppData\Local\Temp\claude\G--Datacurve-Latest-Chals\c252d314-4a06-4b8d-a7b1-0935a59ec986\scratchpad")
+    r"D:\scratch\ch3")
 SEED = 42
 t0 = time.time()
 
